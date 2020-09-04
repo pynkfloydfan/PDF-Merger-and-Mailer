@@ -2,9 +2,17 @@ import sys
 import os
 import PySimpleGUI as sg
 import win32com.client as w32
+import win32api
 from collections import namedtuple
-import itertools
+from itertools import groupby
 from PyPDF2 import PdfFileMerger, PdfFileReader, PdfFileWriter
+import reportlab
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+from operator import attrgetter
+import pandas as pd
+
+
 
 """
     A PySimpleGUI based program that will display the Outlook folder heirarchy, allow you to choose a folder and then
@@ -17,24 +25,65 @@ folder_icon = b'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsSAAAL
 file_icon = b'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsSAAALEgHS3X78AAABU0lEQVQ4y52TzStEURiHn/ecc6XG54JSdlMkNhYWsiILS0lsJaUsLW2Mv8CfIDtr2VtbY4GUEvmIZnKbZsY977Uwt2HcyW1+dTZvt6fn9557BGB+aaNQKBR2ifkbgWR+cX13ubO1svz++niVTA1ArDHDg91UahHFsMxbKWycYsjze4muTsP64vT43v7hSf/A0FgdjQPQWAmco68nB+T+SFSqNUQgcIbN1bn8Z3RwvL22MAvcu8TACFgrpMVZ4aUYcn77BMDkxGgemAGOHIBXxRjBWZMKoCPA2h6qEUSRR2MF6GxUUMUaIUgBCNTnAcm3H2G5YQfgvccYIXAtDH7FoKq/AaqKlbrBj2trFVXfBPAea4SOIIsBeN9kkCwxsNkAqRWy7+B7Z00G3xVc2wZeMSI4S7sVYkSk5Z/4PyBWROqvox3A28PN2cjUwinQC9QyckKALxj4kv2auK0xAAAAAElFTkSuQmCC'
 
 # ------ Create a COM link to Outlook and get the default inbox and the mailbox it comes from ------
-outlook = w32.Dispatch('Outlook.Application').GetNamespace('MAPI')
-inbox = outlook.GetDefaultFolder(6)
-mailbox = inbox.parent
+outlook = w32.Dispatch('Outlook.Application')
+mapi = outlook.GetNamespace('MAPI')
+inbox = mapi.GetDefaultFolder(6)
+mailbox = inbox.Parent
+pdflist =list()
 
-sg.theme('Black')
+# ------ Some constants ------ #
+savefolder = os.path.join(os.path.expandvars("%userprofile%"), 'Documents')
+firstname = win32api.GetUserNameEx(3)
+firstname = firstname.split()[1]
+firstname = re.findall('^[A-Za-z]+', firstname)[0]
 
+sg.theme('LightGreen')
 
 # ------ Set up the Tree with the root node as the default mailbox of Outlook ------ #
 treedata = sg.TreeData()
-treedata.Insert(parent='', key=mailbox.name, text=mailbox.name, values=[mailbox.StoreID, mailbox.EntryID], icon=folder_icon)
+treedata.Insert(parent='', key=mailbox.Name, text=mailbox.Name, 
+                values=[mailbox.StoreID, mailbox.EntryID], icon=folder_icon)
 
+# ------ Custom Class to handle the format of the pdf filenames so the right ones can be grouped and merged in the right order ------ #
+class MyFileName:
+    def __init__(self, filename):
+        self.filename = filename
+        temp = filename.split()
+        # is file a Section or an Appendix?
+        self.section = 'Sec' in temp
+        self.appendix = 'Appendix' in temp
 
-# ------ Define and run function to fill the TreeData with ------ #
-def add_folders(parent):
+        if self.section:
+            self.freq = filename.split('Sec ')[0].strip()
+            self.part = filename.split('Sec ')[1].split()[0].strip()
+            self.region = filename.split('Sec ' = self.part + ' ')[1].strip()
+        elif self.appendix:
+            self.freq = filename.split('Appendix ')[0].strip()
+            self.part = filename.split('Appendix ')[1].split()[0].strip()
+            self.region = filename.split('Appendix ' = self.part + ' ')[1].strip()
+
+    def __repr__(self):
+        return self.filename
+
+# ------ Define and run function to fill the TreeData with all Outlook folders ------ #
+def add_folders(parent, tree=treedata):
+    """
+    Iterates through the parent mailbox adding all the folders and subfolders
+    to the tree
+
+    Params:
+    parent: a reference to an Outlook Folder item
+    tree: a PySimpleGUI treedata object
+
+    Returns:
+    Nothing
+    """
     for f in parent.Folders:
-        treedata.Insert(parent=parent.name, key=f.name, text=f.name, values=[f.StoreID, f.EntryID], icon=folder_icon)
-            # print(key)
+        tree.Insert(parent=parent.Name, key=f.Name, text=f.Name, values=[f.StoreID, f.EntryID], icon=folder_icon)
+        # recursive so all folders and subfolders are added
         add_folders(f)
+
+# Add all outlook folders to the tree
 add_folders(mailbox)
 
 
@@ -54,7 +103,7 @@ layout = [[sg.Text('Outlook folder browser\nSelect folder with pdfs to merge',
                    enable_events=True),
            sg.Listbox(values='',
                       enable_events=True,
-                      size=(40,24),
+                      size=(50,24),
                       key='-FILES-',
                       select_mode=sg.LISTBOX_SELECT_MODE_EXTENDED)],
           [sg.Button('Get pdfs'), sg.Button('Cancel'), sg.Button('Merge pdfs', disabled=True, key='-MERGE-')]]
@@ -71,14 +120,30 @@ TreeDict = treedata.tree_dict
 
 # ------ Get a list of all pdf files in the folder ------ #
 def get_pdfs(folder):
+    """
+    Creates a list of Named Tuples of (filename, entryID, index) 
+    for all pdf files in the folder.
+    filename is a MyFileName object
+
+    Params:
+    folder: a reference to an Outlook Folder object
+
+    Return:
+    A list of named tuples
+    """
     messages = folder.Items
+
     # ------ what about using namedtuple instead to hold filename & entryID? ------ #
     pdf = namedtuple('pdf', 'filename entryID index')
-    pdflist = [[pdf(filename=att.Filename, entryID=m.EntryID, index=att.Index) for att in m.Attachments
-                if att.Filename.split('.')[-1] == 'pdf']
+
+    pdflist = [[pdf(filename=MyFileName(att.Filename), entryID=m.EntryID, index=att.Index) for att in m.Attachments
+                if att.Filename.endswith('pdf')]
                for m in messages if m.Attachments.Count > 0]
-    # ------ flatten the list of lists ------ #
+
+    # ------ flatten the list of lists and sort by filename ------ #
     pdflist = list(itertools.chain.from_iterable(pdflist))
+    pdflist = sorted(pdflist, key=attrgetter('filename.filename'))
+
     return pdflist
 
 # To use GetItemFromID you need the entryID of the Item (e.g. MailItem)
